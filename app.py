@@ -7,8 +7,9 @@ import jwt
 from functools import wraps
 import datetime
 import uuid
-import logging # NEW: Import logging module
+import logging # Import logging module
 from flask_cors import CORS # NEW: Import Flask-CORS
+from waitress import serve
 
 # Load environment variables from .env file
 from dotenv import load_dotenv
@@ -1171,6 +1172,11 @@ def update_award_setting(**kwargs):
 
 
 if __name__ == '__main__':
-    # ensure debug=True
-    app.run(debug=True)
+    # When running directly (for development or with Waitress in simple production)
+    # Ensure this runs the Waitress server for production-like behavior
+    # or the Flask development server for debugging locally.
+    logger.info("Starting Flask application via Waitress server...")
+    serve(app, host='0.0.0.0', port=5000) # Use Waitress to serve the app
+    # For local development with Flask's reloader, you would use:
+    # app.run(debug=True)
 
