@@ -1,0 +1,14 @@
+# Python virtual environment
+venv/
+
+# Environment files
+.env
+
+# PyCharm specific files
+.idea/
+__pycache__/
+*.pyc
+*.egg-info/
+.Python
+.pytest_cache/
+.DS_Store # macOS specific
