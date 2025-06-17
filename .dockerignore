@@ -1,0 +1,22 @@
+# Python virtual environment
+venv/
+
+# PyCharm specific files
+.idea/
+*.pyc
+__pycache__/
+.Python
+.pytest_cache/
+.DS_Store
+
+# Git artifacts
+.git/
+.gitignore
+
+# Environment variables (critical to exclude for security!)
+.env
+
+# Other potential build artifacts or logs
+*.log
+*.sqlite3
+site.db # Exclude the local SQLite database file, it should be managed separately in production
