@@ -13,16 +13,11 @@ from waitress import serve
 
 # Load environment variables from .env file
 from dotenv import load_dotenv
-
 load_dotenv()
 
 # Initialize the Flask application
 app = Flask(__name__)
 
-# NEW: Initialize CORS for your app
-# This will allow cross-origin requests from any domain (*) by default.
-# For production, you should restrict this to your frontend's specific domain(s):
-# CORS(app, resources={r"/api/*": {"origins": "http://yourfrontend.com"}})
 CORS(app) # Allows CORS for all routes and all origins for development simplicity
 
 # Configure the secret key for JWT signing from environment variables
@@ -30,15 +25,19 @@ app.config['SECRET_KEY'] = os.getenv('SECRET_KEY')
 if not app.config['SECRET_KEY']:
     raise RuntimeError("SECRET_KEY not set in .env file. Please generate a strong secret key.")
 
-# Configure the database URI for SQLite
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///site.db'
+# Configure the database URI from DATABASE_URL (e.g. on Heroku) or fall back to SQLite
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv(
+    'DATABASE_URL',
+    'sqlite:///site.db'
+)
+
 # Disable SQLAlchemy event tracking for performance
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 # Initialize the SQLAlchemy instance
 db = SQLAlchemy(app)
 
-# --- NEW: Basic Logging Configuration ---
+# --- Basic Logging Configuration ---
 # Set up a basic logger for the application
 logging.basicConfig(
     level=logging.INFO,
@@ -135,8 +134,6 @@ class Vote(db.Model):
 
     def __repr__(self):
         return f'<Vote from User {self.user_id} for Nominee {self.nominee_id} at {self.timestamp}>'
-
-
 # --- End Database Models ---
 
 # --- AwardSetting Model ---
@@ -299,7 +296,7 @@ def register():
     email = data.get('email')
     password = data.get('password')
 
-    # NEW: More robust input validation
+    # More robust input validation
     if not username or not isinstance(username, str) or not (3 <= len(username) <= 80):
         logger.warning(f"Invalid username during registration: {username}")
         return jsonify({"message": "Username is required and must be 3-80 characters long."}), 400
@@ -347,7 +344,7 @@ def login():
     username = data.get('username')
     password = data.get('password')
 
-    # NEW: Input validation
+    # Input validation
     if not username or not isinstance(username, str) or not password or not isinstance(password, str):
         logger.warning("Login attempt with missing or invalid username/password data types.")
         return jsonify({"message": "Username and password are required."}), 400
@@ -382,6 +379,89 @@ def protected_route(**kwargs):
     }), 200
 
 
+# --- User Profile Management Endpoint ---
+@app.route('/api/user/profile', methods=['PUT'])
+@token_required
+def update_user_profile(**kwargs):
+    current_user = kwargs.get('current_user')
+
+    if not request.is_json:
+        return jsonify({"message": "Request must be JSON"}), 400
+
+    data = request.get_json()
+    new_username = data.get('username')
+    new_email = data.get('email')
+    old_password = data.get('old_password')  # Required for password changes
+    new_password = data.get('new_password')  # New password value
+
+    changes_made = False
+
+    # Handle username update
+    if new_username is not None:
+        if not isinstance(new_username, str) or not (3 <= len(new_username) <= 80):
+            logger.warning(f"Invalid new username format for user {current_user.username}: {new_username}")
+            return jsonify({"message": "Username must be 3-80 characters long."}), 400
+        if new_username != current_user.username:
+            if User.query.filter_by(username=new_username).first():
+                logger.info(
+                    f"Username update failed for user {current_user.username}: New username '{new_username}' already exists.")
+                return jsonify({"message": "New username already taken."}), 409
+            current_user.username = new_username
+            changes_made = True
+            logger.info(f"User {current_user.public_id} updated username to {new_username}.")
+
+    # Handle email update
+    if new_email is not None:
+        if not isinstance(new_email, str) or '@' not in new_email or '.' not in new_email:
+            logger.warning(f"Invalid new email format for user {current_user.username}: {new_email}")
+            return jsonify({"message": "Valid email format is required."}), 400
+        if new_email != current_user.email:
+            if User.query.filter_by(email=new_email).first():
+                logger.info(
+                    f"Email update failed for user {current_user.username}: New email '{new_email}' already exists.")
+                return jsonify({"message": "New email already taken."}), 409
+            current_user.email = new_email
+            changes_made = True
+            logger.info(f"User {current_user.public_id} updated email to {new_email}.")
+
+    # Handle password update
+    if new_password is not None:
+        if not old_password:
+            logger.warning(f"Password change attempted by user {current_user.username} without old_password.")
+            return jsonify({"message": "Current password is required to change password."}), 400
+        if not isinstance(new_password, str) or not (6 <= len(new_password) <= 128):
+            logger.warning(f"Invalid new password length for user {current_user.username}.")
+            return jsonify({"message": "New password must be at least 6 characters long."}), 400
+
+        if not current_user.check_password(old_password):
+            logger.info(f"Password change failed for user {current_user.username}: Invalid current password.")
+            return jsonify({"message": "Incorrect current password."}), 401  # Unauthorized
+
+        current_user.set_password(new_password)
+        changes_made = True
+        logger.info(f"User {current_user.public_id} successfully changed password.")
+
+    if not changes_made:
+        return jsonify({
+                           "message": "No changes provided or changes are identical to current values."}), 200  # Or 400 if you want to force change
+
+    try:
+        db.session.commit()
+        return jsonify({
+            "message": "Profile updated successfully!",
+            "user": {
+                "public_id": current_user.public_id,
+                "username": current_user.username,
+                "email": current_user.email
+            }
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        logger.exception(f"Error updating profile for user {current_user.username}.")
+        return jsonify({"message": "Something went wrong updating profile"}), 500
+# --- End User Profile Management Endpoint ---
+
+
 # --- Category Management API Endpoints (Admin Only) ---
 @app.route('/api/categories', methods=['POST'])
 @admin_required
@@ -397,7 +477,7 @@ def create_category(**kwargs):
     name = data.get('name')
     description = data.get('description')
 
-    # NEW: Input validation
+    # Input validation
     if not name or not isinstance(name, str) or not (3 <= len(name) <= 100):
         logger.warning(f"Invalid category name during creation: {name}")
         return jsonify({"message": "Category name is required and must be 3-100 characters long."}), 400
@@ -468,7 +548,7 @@ def update_category(category_id, **kwargs):
     name = data.get('name')
     description = data.get('description')
 
-    # NEW: Input validation for update
+    # Input validation for update
     if name:
         if not isinstance(name, str) or not (3 <= len(name) <= 100):
             logger.warning(f"Invalid new category name during update for ID {category_id}: {name}")
@@ -530,7 +610,7 @@ def create_nominee(**kwargs):
     description = data.get('description')
     photo_url = data.get('photo_url')
 
-    # NEW: Input validation for nominee creation
+    # Input validation for nominee creation
     if not name or not isinstance(name, str) or not (3 <= len(name) <= 100):
         logger.warning(f"Invalid nominee name during creation: {name}")
         return jsonify({"message": "Nominee name is required and must be 3-100 characters long."}), 400
@@ -565,6 +645,7 @@ def create_nominee(**kwargs):
     try:
         db.session.add(new_nominee)
         db.session.commit()
+        logger.info(f"Nominee '{name}' created successfully in category {category.name}.")
         return jsonify({
             "message": "Nominee created successfully!",
             "nominee_id": new_nominee.id,
@@ -573,7 +654,7 @@ def create_nominee(**kwargs):
         }), 201
     except Exception as e:
         db.session.rollback()
-        print(f"Error creating nominee: {e}")
+        logger.exception(f"Error creating nominee '{name}'.")
         return jsonify({"message": "Something went wrong creating nominee"}), 500
 
 
@@ -640,7 +721,7 @@ def update_nominee(nominee_id, **kwargs):
     photo_url = data.get('photo_url')
     new_category_id = data.get('category_id')
 
-    # NEW: Input validation for nominee update
+    # Input validation for nominee update
     if name:
         if not isinstance(name, str) or not (3 <= len(name) <= 100):
             logger.warning(f"Invalid new nominee name during update for ID {nominee_id}: {name}")
@@ -710,9 +791,7 @@ def delete_nominee(nominee_id, **kwargs):
         logger.exception(f"Error deleting nominee (ID: {nominee_id}).")
         return jsonify({"message": "Something went wrong deleting nominee"}), 500
 
-
 # --- Vote Casting and Monetization Endpoints ---
-
 # Endpoint to get current user's vote balance and history
 @app.route('/api/user/votes', methods=['GET'])
 @token_required
@@ -728,7 +807,6 @@ def get_user_vote_info(**kwargs):
     # Fetch user's vote history
     # We fetch votes associated with the user and order by timestamp descending
     user_votes = Vote.query.filter_by(user_id=current_user.id).order_by(Vote.timestamp.desc()).all()
-
     vote_history_output = []
     for vote in user_votes:
         # To get the nominee and category names, we need to access the relationships.
@@ -765,10 +843,12 @@ def get_user_vote_info(**kwargs):
         "transaction_history": transaction_history_output
     }), 200
 
-# Updated Endpoint for users to initiate vote purchase
+# Endpoint for users to initiate vote purchase
 @app.route('/api/buy-votes', methods=['POST'])
 @token_required
 def initiate_vote_purchase(**kwargs):
+    if not request.is_json:
+        return jsonify({"message": "Request must be JSON"}), 400
     """
     Initiates a vote purchase transaction.
     Instead of directly adding votes, it creates a PENDING transaction.
@@ -838,7 +918,6 @@ def initiate_vote_purchase(**kwargs):
         logger.exception(f"Error initiating payment for user '{current_user.username}'.")
         return jsonify({"message": "Something went wrong initiating payment"}), 500
 
-
 # Endpoint for payment gateway webhook/confirmation
 @app.route('/api/payment/confirm', methods=['POST'])
 def confirm_payment():
@@ -884,7 +963,7 @@ def confirm_payment():
     # 5) Prevent redundant or illegal transitions
     # Redundant COMPLETED confirmation
     if transaction.status == 'COMPLETED' and status.upper() == 'COMPLETED':
-        logger.info(f"Redundant COMPLETED confirmation for TxID {transaction_id}.")
+        logger.info(f"Redundant payment confirmation for already COMPLETED transaction {transaction_id}.")
         return jsonify({"message": f"Transaction already {transaction.status}."}), 409
 
     # COMPLETED can only go to REFUNDED
@@ -895,7 +974,7 @@ def confirm_payment():
     # 6) Load user
     user = User.query.get(transaction.user_id)
     if not user:
-        logger.error(f"User for TxID {transaction_id} not found.")
+        logger.error(f"Associated user not found for transaction {transaction_id} Data inconsistency!")
         return jsonify({"message": "Associated user not found for transaction."}), 500
 
     original_status = transaction.status
@@ -957,19 +1036,19 @@ def cast_vote(**kwargs):
         if nominee_id <= 0:
             raise ValueError
     except (TypeError, ValueError):
-        logger.warning(f"Invalid nominee_id: {raw_nominee_id}")
-        return jsonify({"message": "Nominee ID must be a positive integer."}), 400
+        logger.warning(f"Invalid nominee_id during vote casting by user {current_user.username}: {raw_nominee_id}")
+        return jsonify({"message": "Valid Nominee ID is required."}), 400
 
     # 2) Load nominee
     nominee = Nominee.query.get(nominee_id)
     if not nominee:
-        logger.warning(f"Nominee not found: {nominee_id}")
+        logger.warning(f"Vote cast failed by user {current_user.username}: Nominee {nominee_id} not found")
         return jsonify({"message": "Nominee not found."}), 404
 
     # 3) Check voting-active setting
-    voting_setting = AwardSetting.query.filter_by(key='voting_active').first()
-    if not voting_setting or voting_setting.value.lower() != 'true':
-        logger.info("Attempt to vote while voting is inactive.")
+    voting_active_setting = AwardSetting.query.filter_by(key='voting_active').first()
+    if not voting_active_setting or voting_active_setting.value.lower() != 'true':
+        logger.info(f"Vote attempt by user {current_user.username} failed: Voting is not active.")
         return jsonify({"message": "Voting is currently not active."}), 403
 
     # 4) Enforce voting window
@@ -984,17 +1063,20 @@ def cast_vote(**kwargs):
                 logger.info(f"Voting attempted outside window: now={now}, window={start_time}–{end_time}")
                 return jsonify({"message": "Voting is outside the allowed time period."}), 403
         except ValueError:
-            logger.warning("Invalid date format in voting window settings; skipping window check.")
+            logger.error(
+                "Invalid date format in voting_start_time or voting_end_time settings. Proceeding without time check.",
+                exc_info=True)
+            pass
 
     # 5) Determine free vs paid vote eligibility
-    existing_free = Vote.query.filter_by(
+    existing_free_vote_in_category = Vote.query.filter_by(
         user_id=current_user.id,
         category_id=nominee.category_id,
         is_paid_vote=False
     ).first()
 
     is_paid = False
-    if existing_free:
+    if existing_free_vote_in_category:
         # user already used free vote in this category
         if current_user.vote_balance > 0:
             current_user.vote_balance -= 1
@@ -1039,7 +1121,7 @@ def cast_vote(**kwargs):
 # --- End Vote Casting and Monetization Endpoints ---
 
 
-# NEW: API to get live rankings for a specific category or all categories
+# API to get live rankings for a specific category or all categories
 @app.route('/api/rankings', methods=['GET'])
 def get_live_rankings():
     """
@@ -1100,7 +1182,7 @@ def get_live_rankings():
     return jsonify({"rankings": output}), 200
 
 
-# NEW: API for Admin to manage AwardSettings
+# API for Admin to manage AwardSettings
 @app.route('/api/admin/settings', methods=['GET'])
 @admin_required
 def get_award_settings(**kwargs):
@@ -1134,7 +1216,7 @@ def update_award_setting(**kwargs):
     key = data.get('key')
     value = data.get('value')
 
-    # NEW: Input validation for settings update
+    # Input validation for settings update
     if not key or not isinstance(key, str) or not (1 <= len(key) <= 100):
         logger.warning(f"Invalid setting key during update: {key}")
         return jsonify({"message": "Setting key is required and must be 1-100 characters long."}), 400
@@ -1172,11 +1254,16 @@ def update_award_setting(**kwargs):
 
 
 if __name__ == '__main__':
-    # When running directly (for development or with Waitress in simple production)
-    # Ensure this runs the Waitress server for production-like behavior
-    # or the Flask development server for debugging locally.
-    logger.info("Starting Flask application via Waitress server...")
-    serve(app, host='0.0.0.0', port=5000) # Use Waitress to serve the app
-    # For local development with Flask's reloader, you would use:
-    # app.run(debug=True)
+    # Figure out which port to listen on (default to 5000 if PORT isn’t set)
+    port = int(os.environ.get('PORT', 5000))
+
+    # Log where we’re binding
+    logger.info(f"Starting Flask application via Waitress server on port {port}…")
+
+    # Serve with Waitress on 0.0.0.0:<port>
+    serve(app, host='0.0.0.0', port=port)
+
+    # If you ever want to run the Flask dev server instead, you could do:
+    # app.run(debug=True, port=port)
+
 
