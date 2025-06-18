@@ -5,11 +5,14 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import os
 import jwt
 from functools import wraps
-import datetime
+import datetime as dt
 import uuid
 import logging # Import logging module
 from flask_cors import CORS # NEW: Import Flask-CORS
 from waitress import serve
+import requests # Import requests for external API calls
+import hashlib # For webhook signature verification (though simplified in this lesson)
+import hmac # For webhook signature verification
 
 # Load environment variables from .env file
 from dotenv import load_dotenv
@@ -20,12 +23,22 @@ app = Flask(__name__)
 
 CORS(app) # Allows CORS for all routes and all origins for development simplicity
 
-# Configure the secret key for JWT signing from environment variables
+# Configure secret keys and Paystack API keys
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY')
 if not app.config['SECRET_KEY']:
     raise RuntimeError("SECRET_KEY not set in .env file. Please generate a strong secret key.")
 
-# Configure the database URI from DATABASE_URL (e.g. on Heroku) or fall back to SQLite
+# Paystack configuration
+PAYSTACK_TEST_SECRET_KEY = os.getenv('PAYSTACK_TEST_SECRET_KEY')
+if not PAYSTACK_TEST_SECRET_KEY:
+    raise RuntimeError("PAYSTACK_TEST_SECRET_KEY not set in .env file.")
+
+# Paystack API Base URL (test environment)
+app.config['PAYSTACK_SECRET_KEY']     = os.getenv('PAYSTACK_TEST_SECRET_KEY')
+app.config['PAYSTACK_API_BASE_URL']   = os.getenv('PAYSTACK_API_BASE_URL', 'https://api.paystack.co')
+app.config['PAYSTACK_CALLBACK_URL']   = os.getenv('PAYSTACK_CALLBACK_URL')
+
+# Configure the database URI from DATABASE_URL (e.g. on Render) or fall back to SQLite
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv(
     'DATABASE_URL',
     'sqlite:///site.db'
@@ -129,7 +142,7 @@ class Vote(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     nominee_id = db.Column(db.Integer, db.ForeignKey('nominee.id'), nullable=False)
     category_id = db.Column(db.Integer, db.ForeignKey('category.id'), nullable=False)
-    timestamp = db.Column(db.DateTime, default=datetime.datetime.utcnow, nullable=False)
+    timestamp = db.Column(db.DateTime, default=dt.datetime.now, nullable=False)
     is_paid_vote = db.Column(db.Boolean, default=True, nullable=False)
 
     def __repr__(self):
@@ -160,14 +173,15 @@ class Transaction(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     amount_cedis = db.Column(db.Float, nullable=False)
-    votes_to_add = db.Column(db.Integer, nullable=False)
-    timestamp = db.Column(db.DateTime, default=datetime.datetime.utcnow, nullable=False)
-    status = db.Column(db.String(50), default='PENDING', nullable=False)
-    payment_gateway_ref = db.Column(db.String(255), unique=True, nullable=True)
+    votes_to_add = db.Column(db.Integer, nullable=False)  # Votes associated with this transaction
+    timestamp = db.Column(db.DateTime, default=dt.datetime.now, nullable=False)
+    status = db.Column(db.String(50), default='PENDING', nullable=False)  # PENDING, COMPLETED, FAILED, REFUNDED
+    # NEW: Paystack specific fields
+    paystack_reference = db.Column(db.String(100), unique=True, nullable=True)  # Paystack transaction reference
+    authorization_url = db.Column(db.String(500), nullable=True)  # URL to redirect user for payment
 
-    def __repr__(self):
+def __repr__(self):
         return f'<Transaction {self.id} for User {self.user_id} - {self.amount_cedis} GHS, Status: {self.status}>'
-
 
 # --- End Database Models ---
 
@@ -182,10 +196,10 @@ with app.app_context():
         db.session.add(AwardSetting(key='show_live_rankings', value='false',
                                     description='Should live rankings be visible to public? (true/false)'))
     if not AwardSetting.query.filter_by(key='voting_start_time').first():
-        db.session.add(AwardSetting(key='voting_start_time', value=datetime.datetime.utcnow().isoformat(),
+        db.session.add(AwardSetting(key='voting_start_time', value=dt.datetime.now(dt.timezone.utc).isoformat(),
                                     description='Start time for voting (ISO format)'))
     if not AwardSetting.query.filter_by(key='voting_end_time').first():
-        future_date = datetime.datetime.utcnow() + datetime.timedelta(days=365)
+        future_date = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=365)
         db.session.add(AwardSetting(key='voting_end_time', value=future_date.isoformat(),
                                     description='End time for voting (ISO format)'))
     db.session.commit()
@@ -194,35 +208,25 @@ with app.app_context():
 
 # --- Authentication Decorators ---
 def token_required(f):
-    """
-    Decorator function to enforce JWT authentication on routes.
-    It checks for a valid JWT in the request header.
-    """
-
     @wraps(f)
     def decorated(*args, **kwargs):
-        token = None
-        if 'x-access-token' in request.headers:
-            token = request.headers['x-access-token']
+        token = request.headers.get('x-access-token')
         if not token:
-            logger.warning("Attempt to access token_required route without token.")  # NEW: Logging
+            logger.warning("Missing x-access-token header")
             return jsonify({'message': 'Token is missing!'}), 401
         try:
             data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
             current_user = User.query.filter_by(public_id=data['public_id']).first()
             if not current_user:
-                logger.warning(
-                    f"Invalid token or user not found for public_id: {data.get('public_id')}")  # NEW: Logging
-                return jsonify({'message': 'Token is invalid or user not found!'}), 401
+                raise jwt.InvalidTokenError
         except jwt.ExpiredSignatureError:
-            logger.warning("Attempt to access token_required route with expired token.")  # NEW: Logging
+            logger.warning("Expired token")
             return jsonify({'message': 'Token has expired!'}), 401
         except jwt.InvalidTokenError:
-            logger.error("Attempt to access token_required route with invalid token.", exc_info=True)  # NEW: Logging
+            logger.warning("Invalid token")
             return jsonify({'message': 'Token is invalid!'}), 401
-        except Exception as e:
-            logger.exception("An unexpected error occurred during token validation.")  # NEW: Logging
-            return jsonify({'message': 'An error occurred during token validation!'}), 500
+
+        # inject current_user into the view
         kwargs['current_user'] = current_user
         return f(*args, **kwargs)
 
@@ -242,7 +246,7 @@ def admin_required(f):
         current_user = kwargs.get('current_user')
         if not current_user or current_user.role != 'admin':
             logger.warning(
-                f"Unauthorized admin access attempt by user: {current_user.username if current_user else 'unknown'}")  # NEW: Logging
+                f"Unauthorized admin access attempt by user: {current_user.username if current_user else 'unknown'}")  # Logging
             return jsonify({'message': 'Admin access required!'}), 403
         return f(*args, **kwargs)
 
@@ -326,7 +330,7 @@ def register():
              "vote_balance": new_user.vote_balance}), 201
     except Exception as e:
         db.session.rollback()
-        logger.exception(f"Error during registration for user '{username}'.")  # NEW: Log exception details
+        logger.exception(f"Error during registration for user '{username}'.")  # Log exception details
         return jsonify({"message": "Something went wrong during registration"}), 500
 
 
@@ -358,7 +362,7 @@ def login():
     token_payload = {
         'public_id': user.public_id,
         'role': user.role,
-        'exp': datetime.datetime.utcnow() + datetime.timedelta(minutes=30)
+        'exp': dt.datetime.utcnow() + dt.timedelta(minutes=30)
     }
     token = jwt.encode(token_payload, app.config['SECRET_KEY'], algorithm='HS256')
     logger.info(f"User '{username}' logged in successfully.")
@@ -833,90 +837,146 @@ def get_user_vote_info(**kwargs):
             'votes_to_add': transaction.votes_to_add,
             'timestamp': transaction.timestamp.isoformat(),
             'status': transaction.status,
-            'payment_gateway_ref': transaction.payment_gateway_ref
+            'payment_gateway_ref': transaction.payment_gateway_ref,
+            'paystack_reference': transaction.paystack_reference,  # NEW: Include Paystack ref
+            'authorization_url': transaction.authorization_url  # NEW: Include auth URL
         })
+        logger.info(f"User '{current_user.username}' retrieved vote and transaction history.")
+        return jsonify({
+            "vote_balance": vote_balance,
+            "vote_history": vote_history_output,
+            "transaction_history": transaction_history_output
+        }), 200
 
-    logger.info(f"User '{current_user.username}' retrieved vote and transaction history.")
-    return jsonify({
-        "vote_balance": vote_balance,
-        "vote_history": vote_history_output,
-        "transaction_history": transaction_history_output
-    }), 200
-
-# Endpoint for users to initiate vote purchase
+# UPDATED: Endpoint for users to initiate vote purchase with Paystack (in GHS)
 @app.route('/api/buy-votes', methods=['POST'])
 @token_required
 def initiate_vote_purchase(**kwargs):
-    if not request.is_json:
-        return jsonify({"message": "Request must be JSON"}), 400
-    """
-    Initiates a vote purchase transaction.
-    Instead of directly adding votes, it creates a PENDING transaction.
-    Expects JSON input with 'amount_cedis' (e.g., price paidin GHS) and 'votes_to_add'.
-    """
     current_user = kwargs.get('current_user')
 
-    if not request.is_json:
-        return jsonify({"message": "Request must be JSON"}), 400
+    # 0) JSON guard
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"message": "Request body must be valid JSON."}), 400
 
-    data = request.get_json()
-
-    # 1. Extract the raw values
+    # 1) Raw inputs
     raw_amount = data.get('amount_cedis')
-    raw_votes = data.get('votes_to_add')
+    raw_votes  = data.get('votes_to_add')
 
-    # 2. Convert & validate types
+    # 2) Coerce
     try:
         amount_cedis = float(raw_amount)
         votes_to_add = int(raw_votes)
     except (TypeError, ValueError):
-        # non‐numeric or missing
         logger.warning(
-            f"Conversion error during purchase initiation for user "
-            f"{current_user.username}: amount_cedis={raw_amount}, votes_to_add={raw_votes}"
+            f"Invalid input for user {current_user.username}: "
+            f"amount_cedis={raw_amount}, votes_to_add={raw_votes}"
         )
         return jsonify({
-            "message": "Both amount_cedis and votes_to_add must be valid numbers."
+            "message": "amount_cedis must be a number and votes_to_add an integer."
         }), 400
 
-    # 3. Validate > 0
+    # 3) Business validation
     if amount_cedis <= 0:
         logger.warning(
-            f"Invalid amount_cedis during purchase initiation for user "
-            f"{current_user.username}: {amount_cedis}"
+            f"Invalid amount_cedis for user {current_user.username}: {amount_cedis}"
         )
-        return jsonify({"message": "Valid amount (Cedis) is required."}), 400
-
+        return jsonify({"message": "Valid amount (in Cedis) is required."}), 400
     if votes_to_add <= 0:
         logger.warning(
-            f"Invalid votes_to_add during purchase initiation for user "
-            f"{current_user.username}: {votes_to_add}"
+            f"Invalid votes_to_add for user {current_user.username}: {votes_to_add}"
         )
         return jsonify({"message": "Valid number of votes to add is required."}), 400
 
-    new_transaction = Transaction(
-        user_id=current_user.id,
-        amount_cedis=amount_cedis,
-        votes_to_add=votes_to_add,
-        status='PENDING'  # Initial status is PENDING
-    )
+    # 4) Currency conversion
+    amount_pesewas = int(amount_cedis * 100)
 
+    # 5) Paystack payload & headers from config (missing PAYSTACK_CALLBACK_URL)
+    paystack_data = {
+        "email": current_user.email,
+        "amount": amount_pesewas,
+        "currency": "GHS",
+        "callback_url": app.config['PAYSTACK_CALLBACK_URL'],
+        "metadata": {
+            "user_id": current_user.id,
+            "votes_expected": votes_to_add
+        }
+    }
+
+    # 5) Paystack payload & headers from config
+    #paystack_data = {
+    #    "email":        current_user.email,
+    #    "amount":       amount_pesewas,
+    #    "currency":     "GHS",
+    #    "callback_url": app.config['PAYSTACK_CALLBACK_URL'],
+    #    "metadata": {
+    #        "user_id":        current_user.id,
+    #        "votes_expected": votes_to_add
+    #    }
+    #}
+    headers = {
+        "Authorization": f"Bearer {app.config['PAYSTACK_SECRET_KEY']}",
+        "Content-Type":  "application/json"
+    }
+
+    # 6) Call Paystack
     try:
-        db.session.add(new_transaction)
-        db.session.commit()
-        logger.info(
-            f"User '{current_user.username}' initiated payment for {votes_to_add} votes (TxID: {new_transaction.id}).")
-        return jsonify({
-            "message": "Payment initiation successful. Please complete the payment.",
-            "transaction_id": new_transaction.id,
-            "status": new_transaction.status,
-            "amount_to_pay": new_transaction.amount_cedis,
-            "votes_expected": new_transaction.votes_to_add
-        }), 202
-    except Exception as e:
+        resp = requests.post(
+            #f"{app.config['PAYSTACK_API_BASE_URL']}/transaction/initialize",
+            f"{app.config['PAYSTACK_API_BASE_URL']}/transaction/initialize",
+            json=paystack_data, headers=headers
+        )
+        resp.raise_for_status()
+        result = resp.json()
+
+        if result.get('status'):
+            data  = result['data']
+            new_tx = Transaction(
+                user_id           = current_user.id,
+                amount_cedis      = amount_cedis,
+                votes_to_add      = votes_to_add,
+                status            = 'PENDING',
+                paystack_reference= data['reference'],
+                authorization_url = data['authorization_url']
+            )
+            db.session.add(new_tx)
+            db.session.commit()
+
+            logger.info(
+                f"User {current_user.username} initiated payment, TxID={new_tx.id}, "
+                f"Ref={data['reference']}"
+            )
+            """
+            return jsonify({
+                "message":           "Payment initiation successful. Redirect to Paystack.",
+                "transaction_id":    new_tx.id,
+                "paystack_reference": data['reference'],
+                "authorization_url": data['authorization_url'],
+                "status":            "REDIRECT_REQUIRED"
+            }), 202
+            """
+            return jsonify({
+                "status": "REDIRECT_REQUIRED",
+                "transaction_id": new_tx.id,
+                "paystack_reference": data['reference'],
+                "authorization_url": data['authorization_url']
+            }), 202
+
+        else:
+            err = result.get('message', 'Unknown error')
+            logger.error(f"Paystack init failed for {current_user.username}: {err}")
+            return jsonify({"message": f"Initialization failed: {err}"}), 500
+
+    except requests.exceptions.RequestException:
+        logger.exception(f"Network/API error for user {current_user.username}")
+        return jsonify({"message": "Error communicating with payment gateway."}), 500
+
+    except Exception:
         db.session.rollback()
-        logger.exception(f"Error initiating payment for user '{current_user.username}'.")
-        return jsonify({"message": "Something went wrong initiating payment"}), 500
+        logger.exception(f"Unexpected error for user {current_user.username}")
+        return jsonify({"message": "Something went wrong initiating payment."}), 500
+
+
 
 # Endpoint for payment gateway webhook/confirmation
 @app.route('/api/payment/confirm', methods=['POST'])
@@ -1017,6 +1077,163 @@ def confirm_payment():
         logger.exception(f"Error confirming payment for TxID {transaction_id}")
         return jsonify({"message": "Something went wrong confirming payment."}), 500
 
+# Endpoint for Paystack Webhook (working in GHS)
+@app.route('/api/payment/paystack-webhook', methods=['POST'])
+def paystack_webhook():
+    """
+    Handles Paystack webhook notifications for transaction status updates.
+    This endpoint is called by Paystack's server, NOT by your frontend.
+    """
+    # 1. Verify Paystack Signature (CRITICAL FOR SECURITY)
+    # This prevents malicious actors from faking successful payments.
+    # In a real app, you would verify the 'x-paystack-signature' header
+    # using your PAYSTACK_TEST_SECRET_KEY and the raw request body.
+    # For simplicity in this lesson, we will skip full signature verification
+    # but acknowledge its importance.
+    # Read more: https://paystack.com/docs/api/webhooks/#verifying-webhooks
+
+    # Recommended:
+    # try:
+    #     paystack_signature = request.headers.get('x-paystack-signature')
+    #     if not paystack_signature:
+    #         logger.warning("Paystack webhook received without signature.")
+    #         return jsonify({"message": "Signature missing"}), 400
+    #
+    #     request_body = request.get_data() # Get raw request body
+    #     computed_hash = hmac.new(
+    #         PAYSTACK_TEST_SECRET_KEY.encode('utf-8'),
+    #         request_body,
+    #         digestmod=hashlib.sha512
+    #     ).hexdigest()
+    #
+    #     if not hmac.compare_digest(computed_hash, paystack_signature):
+    #         logger.warning("Paystack webhook received with invalid signature.")
+    #         return jsonify({"message": "Invalid signature"}), 400
+    # except Exception as e:
+    #     logger.exception("Error verifying Paystack webhook signature.")
+    #     return jsonify({"message": "Internal webhook verification error"}), 500
+
+    event_data = request.get_json()
+    logger.info(f"Paystack webhook received: Event type: {event_data.get('event')}, Ref: {event_data['data']['reference']}")
+
+    if event_data.get('event') == 'charge.success':
+        paystack_reference    = event_data['data']['reference']
+        transaction_status   = event_data['data']['status']  # 'success'
+        amount_paid_pesewas  = event_data['data']['amount']  # in pesewas (smallest GHS unit)
+        amount_paid_cedis    = amount_paid_pesewas / 100     # convert to cedis
+
+        # Find the pending transaction in your database using Paystack's reference
+        transaction = Transaction.query.filter_by(paystack_reference=paystack_reference).first()
+
+        if not transaction:
+            logger.error(f"Paystack webhook: Transaction not found for reference: {paystack_reference}")
+            return jsonify({"message": "Transaction not found in our system"}), 404
+
+        if transaction.status == 'COMPLETED':
+            logger.info(f"Paystack webhook: Transaction {paystack_reference} already completed. Skipping.")
+            return jsonify({"message": "Transaction already completed"}), 200
+
+        user = User.query.get(transaction.user_id)
+        if not user:
+            logger.error(f"Paystack webhook: User not found for transaction {paystack_reference}, user_id {transaction.user_id}.")
+            return jsonify({"message": "Associated user not found"}), 500
+
+        # Verify amount if necessary (important for production)
+        if amount_paid_cedis < transaction.amount_cedis:
+            logger.warning(
+                f"Paystack webhook: Amount mismatch for {paystack_reference}. "
+                f"Expected {transaction.amount_cedis} GHS, Paid {amount_paid_cedis} GHS."
+            )
+            transaction.status = 'FAILED_AMOUNT_MISMATCH'
+            db.session.commit()
+            return jsonify({"message": "Amount mismatch"}), 400
+
+        try:
+            # Update transaction status and user's vote balance
+            original_status = transaction.status
+            transaction.status = 'COMPLETED'
+
+            # Only add votes if this was still pending (or failed and retry allowed)
+            if original_status in ['PENDING', 'FAILED']:
+                user.vote_balance += transaction.votes_to_add
+                logger.info(
+                    f"Paystack webhook: Added {transaction.votes_to_add} votes to user "
+                    f"{user.username} (Ref: {paystack_reference}). New balance: {user.vote_balance}"
+                )
+            else:
+                logger.warning(
+                    f"Paystack webhook: Votes not added for {paystack_reference} as "
+                    f"original status was {original_status}."
+                )
+
+            db.session.commit()
+            return jsonify({"message": "Webhook processed successfully"}), 200
+
+        except Exception as e:
+            db.session.rollback()
+            logger.exception(f"Paystack webhook: Error processing charge for {paystack_reference}.")
+            return jsonify({"message": "Internal server error during processing"}), 500
+
+    elif event_data.get('event') == 'charge.failed':
+        paystack_reference = event_data['data']['reference']
+        logger.info(f"Paystack webhook: Charge failed for reference {paystack_reference}.")
+
+        transaction = Transaction.query.filter_by(paystack_reference=paystack_reference).first()
+        if transaction:
+            transaction.status = 'FAILED'
+            try:
+                db.session.commit()
+                logger.info(f"Paystack webhook: Transaction {paystack_reference} marked as FAILED.")
+            except Exception as e:
+                db.session.rollback()
+                logger.exception(f"Paystack webhook: Error marking {paystack_reference} as FAILED.")
+                return jsonify({"message": "Internal server error processing failed charge"}), 500
+
+        return jsonify({"message": "Failed charge webhook processed"}), 200
+
+    else:
+        logger.info(f"Paystack webhook: Unhandled event type: {event_data.get('event')}")
+        return jsonify({"message": "Event type not handled"}), 200 # Acknowledge for other event types
+
+# --- Paystack Endpoints ---
+
+# Original confirm_payment (now removed or renamed, as Paystack webhook replaces it)
+# We will effectively replace the previous /api/payment/confirm with /api/payment/paystack-webhook
+# and link the user's browser back to a frontend status page that verifies the transaction
+# using Paystack's own verification API (next step in real-world).
+# For now, this is removed as the webhook is the primary backend confirmation.
+
+# --- Callback Route ---
+from flask import redirect
+
+@app.route('/api/payment/paystack-callback', methods=['GET'])
+def paystack_callback():
+    # Paystack will append ?trxref=<reference> to your URL
+    reference = request.args.get('trxref')
+    if not reference:
+        return "Missing transaction reference", 400
+
+    # (Optional) Verify with Paystack’s verify endpoint
+    try:
+        verify_resp = requests.get(
+            f"{app.config['PAYSTACK_API_BASE_URL']}/transaction/verify/{reference}",
+            headers={"Authorization": f"Bearer {app.config['PAYSTACK_SECRET_KEY']}"}
+        )
+        verify_resp.raise_for_status()
+        result = verify_resp.json()
+    except Exception:
+        # if you prefer to skip verification and trust your webhook, remove these lines
+        return "Unable to verify transaction", 502
+
+    status = result.get('data', {}).get('status')
+    if status == 'success':
+        # At this point your webhook has probably already credited the votes.
+        # Now redirect the user to your front-end “thank you” page:
+        return redirect(f"http://localhost:3000/payment-success?reference={reference}")
+    else:
+        # redirect to a “failed” page if something went wrong
+        return redirect(f"http://localhost:3000/payment-failed?reference={reference}")
+
 
 # Endpoint for casting a vote
 @app.route('/api/vote', methods=['POST'])
@@ -1054,11 +1271,11 @@ def cast_vote(**kwargs):
     # 4) Enforce voting window
     start_cfg = AwardSetting.query.filter_by(key='voting_start_time').first()
     end_cfg = AwardSetting.query.filter_by(key='voting_end_time').first()
-    now = datetime.datetime.utcnow()
+    now = dt.datetime.now()
     if start_cfg and end_cfg:
         try:
-            start_time = datetime.datetime.fromisoformat(start_cfg.value)
-            end_time = datetime.datetime.fromisoformat(end_cfg.value)
+            start_time = dt.datetime.fromisoformat(start_cfg.value)
+            end_time = dt.datetime.fromisoformat(end_cfg.value)
             if not (start_time <= now <= end_time):
                 logger.info(f"Voting attempted outside window: now={now}, window={start_time}–{end_time}")
                 return jsonify({"message": "Voting is outside the allowed time period."}), 403
