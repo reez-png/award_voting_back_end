@@ -37,6 +37,8 @@ if not PAYSTACK_TEST_SECRET_KEY:
 app.config['PAYSTACK_SECRET_KEY']     = os.getenv('PAYSTACK_TEST_SECRET_KEY')
 app.config['PAYSTACK_API_BASE_URL']   = os.getenv('PAYSTACK_API_BASE_URL', 'https://api.paystack.co')
 app.config['PAYSTACK_CALLBACK_URL']   = os.getenv('PAYSTACK_CALLBACK_URL')
+app.config['PAYSTACK_WEBHOOK_URL']    = os.getenv('PAYSTACK_WEBHOOK_URL')
+
 
 # Configure the database URI from DATABASE_URL (e.g. on Render) or fall back to SQLite
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv(
@@ -179,6 +181,7 @@ class Transaction(db.Model):
     # NEW: Paystack specific fields
     paystack_reference = db.Column(db.String(100), unique=True, nullable=True)  # Paystack transaction reference
     authorization_url = db.Column(db.String(500), nullable=True)  # URL to redirect user for payment
+    payment_gateway_ref = db.Column(db.String(255), nullable=True) #
 
 def __repr__(self):
         return f'<Transaction {self.id} for User {self.user_id} - {self.amount_cedis} GHS, Status: {self.status}>'
@@ -830,6 +833,7 @@ def get_user_vote_info(**kwargs):
         # Fetch user's transaction history
     user_transactions = Transaction.query.filter_by(user_id=current_user.id).order_by(Transaction.timestamp.desc()).all()
     transaction_history_output = []
+
     for transaction in user_transactions:
         transaction_history_output.append({
             'transaction_id': transaction.id,
@@ -837,16 +841,15 @@ def get_user_vote_info(**kwargs):
             'votes_to_add': transaction.votes_to_add,
             'timestamp': transaction.timestamp.isoformat(),
             'status': transaction.status,
-            'payment_gateway_ref': transaction.payment_gateway_ref,
-            'paystack_reference': transaction.paystack_reference,  # NEW: Include Paystack ref
-            'authorization_url': transaction.authorization_url  # NEW: Include auth URL
+            'paystack_reference': transaction.paystack_reference,
+            'authorization_url': transaction.authorization_url
         })
-        logger.info(f"User '{current_user.username}' retrieved vote and transaction history.")
-        return jsonify({
-            "vote_balance": vote_balance,
-            "vote_history": vote_history_output,
-            "transaction_history": transaction_history_output
-        }), 200
+    logger.info(f"User '{current_user.username}' retrieved vote and transaction history.")
+    return jsonify({
+        "vote_balance": vote_balance,
+        "vote_history": vote_history_output,
+        "transaction_history": transaction_history_output
+    }), 200
 
 # UPDATED: Endpoint for users to initiate vote purchase with Paystack (in GHS)
 @app.route('/api/buy-votes', methods=['POST'])
@@ -977,16 +980,9 @@ def initiate_vote_purchase(**kwargs):
         return jsonify({"message": "Something went wrong initiating payment."}), 500
 
 
-
 # Endpoint for payment gateway webhook/confirmation
 @app.route('/api/payment/confirm', methods=['POST'])
 def confirm_payment():
-    """
-    Endpoint to confirm a payment. In a real scenario, this would be a webhook
-    from a payment gateway. For testing, you'll call this manually.
-    Expects JSON input with 'transaction_id', 'status' (e.g., 'COMPLETED', 'FAILED'),
-    and optionally 'payment_gateway_ref'.
-    """
     if not request.is_json:
         return jsonify({"message": "Request must be JSON"}), 400
 
@@ -1082,88 +1078,80 @@ def confirm_payment():
 def paystack_webhook():
     """
     Handles Paystack webhook notifications for transaction status updates.
-    This endpoint is called by Paystack's server, NOT by your frontend.
+    This endpoint is called by Paystack's server (not by your frontend).
     """
-    # 1. Verify Paystack Signature (CRITICAL FOR SECURITY)
-    # This prevents malicious actors from faking successful payments.
-    # In a real app, you would verify the 'x-paystack-signature' header
-    # using your PAYSTACK_TEST_SECRET_KEY and the raw request body.
-    # For simplicity in this lesson, we will skip full signature verification
-    # but acknowledge its importance.
-    # Read more: https://paystack.com/docs/api/webhooks/#verifying-webhooks
+    # 0. Log every incoming webhook right away
+    logger.info(
+        f"🟢 Incoming webhook to /api/payment/paystack-webhook\n"
+        f"Headers: {dict(request.headers)}\n"
+        f"Body: {request.get_data(as_text=True)}"
+    )
 
-    # Recommended:
-    # try:
-    #     paystack_signature = request.headers.get('x-paystack-signature')
-    #     if not paystack_signature:
-    #         logger.warning("Paystack webhook received without signature.")
-    #         return jsonify({"message": "Signature missing"}), 400
-    #
-    #     request_body = request.get_data() # Get raw request body
-    #     computed_hash = hmac.new(
-    #         PAYSTACK_TEST_SECRET_KEY.encode('utf-8'),
-    #         request_body,
-    #         digestmod=hashlib.sha512
-    #     ).hexdigest()
-    #
-    #     if not hmac.compare_digest(computed_hash, paystack_signature):
-    #         logger.warning("Paystack webhook received with invalid signature.")
-    #         return jsonify({"message": "Invalid signature"}), 400
-    # except Exception as e:
-    #     logger.exception("Error verifying Paystack webhook signature.")
-    #     return jsonify({"message": "Internal webhook verification error"}), 500
+    # # 1. Grab Paystack signature header
+    # paystack_sig = request.headers.get('x-paystack-signature')
+    # if not paystack_sig:
+    #     logger.warning("Paystack webhook received without signature.")
+    #     return jsonify({"message": "Signature missing"}), 400
 
-    event_data = request.get_json()
-    logger.info(f"Paystack webhook received: Event type: {event_data.get('event')}, Ref: {event_data['data']['reference']}")
+    # # 2. Read the raw request body (bytes)
+    # raw_body = request.get_data()
 
-    if event_data.get('event') == 'charge.success':
-        paystack_reference    = event_data['data']['reference']
-        transaction_status   = event_data['data']['status']  # 'success'
-        amount_paid_pesewas  = event_data['data']['amount']  # in pesewas (smallest GHS unit)
-        amount_paid_cedis    = amount_paid_pesewas / 100     # convert to cedis
+    # # 3. Compute HMAC-SHA512 using your secret key
+    # computed_hash = hmac.new(
+    #     PAYSTACK_SECRET.encode('utf-8'),
+    #     raw_body,
+    #     digestmod=hashlib.sha512
+    # ).hexdigest()
 
-        # Find the pending transaction in your database using Paystack's reference
-        transaction = Transaction.query.filter_by(paystack_reference=paystack_reference).first()
+    # # 4. Constant-time compare of signatures
+    # if not hmac.compare_digest(computed_hash, paystack_sig):
+    #     logger.warning("Paystack webhook received with invalid signature.")
+    #     return jsonify({"message": "Invalid signature"}), 400
+
+    # 2. Parse the JSON payload
+    event_data = request.get_json(force=True)
+    event_type = event_data.get('event')
+    reference = event_data['data'].get('reference')
+    logger.info(f"Paystack webhook received: event={event_type}, reference={reference}")
+
+    # 3. Handle "charge.success"
+    if event_type == 'charge.success':
+        amount_paid_pesewas = event_data['data']['amount']
+        amount_paid_cedis = amount_paid_pesewas / 100
+        transaction = Transaction.query.filter_by(paystack_reference=reference).first()
 
         if not transaction:
-            logger.error(f"Paystack webhook: Transaction not found for reference: {paystack_reference}")
-            return jsonify({"message": "Transaction not found in our system"}), 404
+            logger.error(f"Transaction not found for reference: {reference}")
+            return jsonify({"message": "Transaction not found"}), 404
 
         if transaction.status == 'COMPLETED':
-            logger.info(f"Paystack webhook: Transaction {paystack_reference} already completed. Skipping.")
-            return jsonify({"message": "Transaction already completed"}), 200
+            logger.info(f"Transaction {reference} already completed; skipping.")
+            return jsonify({"message": "Already completed"}), 200
 
-        user = User.query.get(transaction.user_id)
-        if not user:
-            logger.error(f"Paystack webhook: User not found for transaction {paystack_reference}, user_id {transaction.user_id}.")
-            return jsonify({"message": "Associated user not found"}), 500
-
-        # Verify amount if necessary (important for production)
+        # Verify amount matches
         if amount_paid_cedis < transaction.amount_cedis:
             logger.warning(
-                f"Paystack webhook: Amount mismatch for {paystack_reference}. "
-                f"Expected {transaction.amount_cedis} GHS, Paid {amount_paid_cedis} GHS."
+                f"Amount mismatch for {reference}: expected={transaction.amount_cedis}, paid={amount_paid_cedis}"
             )
             transaction.status = 'FAILED_AMOUNT_MISMATCH'
             db.session.commit()
             return jsonify({"message": "Amount mismatch"}), 400
 
         try:
-            # Update transaction status and user's vote balance
+            # Update status and credit votes
             original_status = transaction.status
             transaction.status = 'COMPLETED'
 
-            # Only add votes if this was still pending (or failed and retry allowed)
             if original_status in ['PENDING', 'FAILED']:
+                user = User.query.get(transaction.user_id)
+                if not user:
+                    logger.error(f"User not found for transaction {reference} (user_id={transaction.user_id})")
+                    return jsonify({"message": "User not found"}), 500
+
                 user.vote_balance += transaction.votes_to_add
                 logger.info(
-                    f"Paystack webhook: Added {transaction.votes_to_add} votes to user "
-                    f"{user.username} (Ref: {paystack_reference}). New balance: {user.vote_balance}"
-                )
-            else:
-                logger.warning(
-                    f"Paystack webhook: Votes not added for {paystack_reference} as "
-                    f"original status was {original_status}."
+                    f"Credited {transaction.votes_to_add} votes to {user.username}; "
+                    f"new balance={user.vote_balance}"
                 )
 
             db.session.commit()
@@ -1171,29 +1159,28 @@ def paystack_webhook():
 
         except Exception as e:
             db.session.rollback()
-            logger.exception(f"Paystack webhook: Error processing charge for {paystack_reference}.")
-            return jsonify({"message": "Internal server error during processing"}), 500
+            logger.exception(f"Error processing transaction {reference}")
+            return jsonify({"message": "Internal server error"}), 500
 
-    elif event_data.get('event') == 'charge.failed':
-        paystack_reference = event_data['data']['reference']
-        logger.info(f"Paystack webhook: Charge failed for reference {paystack_reference}.")
-
-        transaction = Transaction.query.filter_by(paystack_reference=paystack_reference).first()
+    # 4. Handle "charge.failed"
+    elif event_type == 'charge.failed':
+        transaction = Transaction.query.filter_by(paystack_reference=reference).first()
         if transaction:
             transaction.status = 'FAILED'
             try:
                 db.session.commit()
-                logger.info(f"Paystack webhook: Transaction {paystack_reference} marked as FAILED.")
-            except Exception as e:
+                logger.info(f"Marked transaction {reference} as FAILED")
+            except Exception:
                 db.session.rollback()
-                logger.exception(f"Paystack webhook: Error marking {paystack_reference} as FAILED.")
-                return jsonify({"message": "Internal server error processing failed charge"}), 500
+                logger.exception(f"Error marking {reference} as FAILED")
+                return jsonify({"message": "Internal error"}), 500
 
-        return jsonify({"message": "Failed charge webhook processed"}), 200
+        return jsonify({"message": "Failed charge processed"}), 200
 
+    # 5. Other events
     else:
-        logger.info(f"Paystack webhook: Unhandled event type: {event_data.get('event')}")
-        return jsonify({"message": "Event type not handled"}), 200 # Acknowledge for other event types
+        logger.info(f"Unhandled Paystack event type: {event_type}")
+        return jsonify({"message": "Event not handled"}), 200 # Acknowledge for other event types
 
 # --- Paystack Endpoints ---
 
@@ -1229,10 +1216,18 @@ def paystack_callback():
     if status == 'success':
         # At this point your webhook has probably already credited the votes.
         # Now redirect the user to your front-end “thank you” page:
-        return redirect(f"http://localhost:3000/payment-success?reference={reference}")
+        #return redirect(f"http://localhost:3000/payment-success?reference={reference}") #change back to this when front end creates, replace in .env file
+        return redirect(f"http://127.0.0.1:5000/payment-success?reference={reference}")
     else:
         # redirect to a “failed” page if something went wrong
-        return redirect(f"http://localhost:3000/payment-failed?reference={reference}")
+        #return redirect(f"http://localhost:3000/payment-failed?reference={reference}") #change back to this when front end creates, replace in .env file
+        return redirect(f"http://127.0.0.1:5000/payment-success?reference={reference}")
+
+#--- Flask route for success page ---
+@app.route('/payment-success')
+def payment_success_page():
+    ref = request.args.get('reference')
+    return f"<h1>🎉 Payment {ref} successful!</h1><p>Your votes have been credited.</p>"
 
 
 # Endpoint for casting a vote
