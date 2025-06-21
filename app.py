@@ -1,5 +1,5 @@
 # Import necessary Flask components and other libraries
-from flask import Flask, jsonify, request, make_response
+from flask import Flask, jsonify, request, json, make_response
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
 import os
@@ -178,13 +178,31 @@ class Transaction(db.Model):
     votes_to_add = db.Column(db.Integer, nullable=False)  # Votes associated with this transaction
     timestamp = db.Column(db.DateTime, default=dt.datetime.now, nullable=False)
     status = db.Column(db.String(50), default='PENDING', nullable=False)  # PENDING, COMPLETED, FAILED, REFUNDED
-    # NEW: Paystack specific fields
+    # Paystack specific fields
     paystack_reference = db.Column(db.String(100), unique=True, nullable=True)  # Paystack transaction reference
     authorization_url = db.Column(db.String(500), nullable=True)  # URL to redirect user for payment
     payment_gateway_ref = db.Column(db.String(255), nullable=True) #
 
 def __repr__(self):
         return f'<Transaction {self.id} for User {self.user_id} - {self.amount_cedis} GHS, Status: {self.status}>'
+
+
+# AdminLogEntry Model
+class AdminLogEntry(db.Model):
+    """
+    Records administrative actions for auditing purposes.
+    """
+    id = db.Column(db.Integer, primary_key=True)
+    admin_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    admin_username = db.Column(db.String(80), nullable=False) # Store username to keep record even if user is deleted/name changes
+    action_type = db.Column(db.String(50), nullable=False) # e.g., 'CREATE', 'UPDATE', 'DELETE'
+    resource_type = db.Column(db.String(50), nullable=False) # e.g., 'CATEGORY', 'NOMINEE', 'SETTING'
+    resource_id = db.Column(db.Integer, nullable=True) # ID of the resource affected (if applicable)
+    details = db.Column(db.Text, nullable=True) # JSON string of changes, or detailed message
+    timestamp = db.Column(db.DateTime, default=dt.datetime.now, nullable=False)
+
+    def __repr__(self):
+        return f'<AdminLog {self.admin_username} {self.action_type} {self.resource_type} {self.resource_id} at {self.timestamp}>'
 
 # --- End Database Models ---
 
@@ -213,26 +231,29 @@ with app.app_context():
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        token = request.headers.get('x-access-token')
+        token = None
+        if 'x-access-token' in request.headers:
+            token = request.headers['x-access-token']
         if not token:
-            logger.warning("Missing x-access-token header")
+            logger.warning("Attempt to access token_required route without token.")
             return jsonify({'message': 'Token is missing!'}), 401
         try:
             data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
             current_user = User.query.filter_by(public_id=data['public_id']).first()
             if not current_user:
-                raise jwt.InvalidTokenError
+                logger.warning(f"Invalid token or user not found for public_id: {data.get('public_id')}")
+                return jsonify({'message': 'Token is invalid or user not found!'}), 401
         except jwt.ExpiredSignatureError:
-            logger.warning("Expired token")
+            logger.warning("Attempt to access token_required route with expired token.")
             return jsonify({'message': 'Token has expired!'}), 401
         except jwt.InvalidTokenError:
-            logger.warning("Invalid token")
+            logger.error("Attempt to access token_required route with invalid token.", exc_info=True)
             return jsonify({'message': 'Token is invalid!'}), 401
-
-        # inject current_user into the view
+        except Exception as e:
+            logger.exception("An unexpected error occurred during token validation.")
+            return jsonify({'message': 'An error occurred during token validation!'}), 500
         kwargs['current_user'] = current_user
         return f(*args, **kwargs)
-
     return decorated
 
 
@@ -249,7 +270,7 @@ def admin_required(f):
         current_user = kwargs.get('current_user')
         if not current_user or current_user.role != 'admin':
             logger.warning(
-                f"Unauthorized admin access attempt by user: {current_user.username if current_user else 'unknown'}")  # Logging
+                f"Unauthorized admin access attempt by user: {current_user.username if current_user else 'unknown'}")
             return jsonify({'message': 'Admin access required!'}), 403
         return f(*args, **kwargs)
 
@@ -293,7 +314,7 @@ def status():
 
 @app.route('/api/register', methods=['POST'])
 def register():
-    # NEW: Input validation for JSON type moved to global handler, but still check here for specific data.
+    # Input validation for JSON type moved to global handler, but still check here for specific data.
     if not request.is_json:
         # This will be caught by @app.errorhandler(400) if content-type is wrong
         return jsonify({"message": "Request must be JSON"}), 400 # Still explicit here for clarity
@@ -365,7 +386,7 @@ def login():
     token_payload = {
         'public_id': user.public_id,
         'role': user.role,
-        'exp': dt.datetime.utcnow() + dt.timedelta(minutes=30)
+        'exp': dt.datetime.now() + dt.timedelta(minutes=30)
     }
     token = jwt.encode(token_payload, app.config['SECRET_KEY'], algorithm='HS256')
     logger.info(f"User '{username}' logged in successfully.")
@@ -473,10 +494,7 @@ def update_user_profile(**kwargs):
 @app.route('/api/categories', methods=['POST'])
 @admin_required
 def create_category(**kwargs):
-    """
-    Creates a new category. Admin only.
-    Expects JSON input with 'name' and optionally 'description'.
-    """
+    current_user = kwargs.get('current_user') # Get current admin user
     if not request.is_json:
         return jsonify({"message": "Request must be JSON"}), 400
 
@@ -502,6 +520,17 @@ def create_category(**kwargs):
         db.session.add(new_category)
         db.session.commit()
         logger.info(f"Category '{name}' created successfully.")
+        # Log admin action
+        new_log_entry = AdminLogEntry(
+            admin_id=current_user.id,
+            admin_username=current_user.username,
+            action_type='CREATE',
+            resource_type='CATEGORY',
+            resource_id=new_category.id,
+            details=f"Created category: {new_category.name}"
+        )
+        db.session.add(new_log_entry)
+        db.session.commit()  # Commit log entry
         return jsonify({
             "message": "Category created successfully!",
             "category_id": new_category.id,
@@ -543,6 +572,7 @@ def get_single_category(category_id):
 @app.route('/api/categories/<int:category_id>', methods=['PUT'])
 @admin_required
 def update_category(category_id, **kwargs):
+    current_user = kwargs.get('current_user') # Get current admin user
     if not request.is_json:
         return jsonify({"message": "Request must be JSON"}), 400
 
@@ -554,6 +584,9 @@ def update_category(category_id, **kwargs):
     data = request.get_json()
     name = data.get('name')
     description = data.get('description')
+
+    old_name = category.name # Store old values for log details
+    old_description = category.description
 
     # Input validation for update
     if name:
@@ -575,6 +608,26 @@ def update_category(category_id, **kwargs):
     try:
         db.session.commit()
         logger.info(f"Category '{category.name}' (ID: {category_id}) updated successfully.")
+        # Log admin action
+        details = {}
+        if name and name != old_name:
+            details['name_changed_from'] = old_name
+            details['name_changed_to'] = name
+        if description is not None and description != old_description:
+            details['description_changed_from'] = old_description
+            details['description_changed_to'] = description
+
+        if details:  # Only log if actual changes were made
+            new_log_entry = AdminLogEntry(
+                admin_id=current_user.id,
+                admin_username=current_user.username,
+                action_type='UPDATE',
+                resource_type='CATEGORY',
+                resource_id=category.id,
+                details=json.dumps(details)  # Store details as JSON string
+            )
+            db.session.add(new_log_entry)
+            db.session.commit()  # Commit log entry
         return jsonify({"message": "Category updated successfully!", "category": {
             'id': category.id,
             'name': category.name,
@@ -589,14 +642,29 @@ def update_category(category_id, **kwargs):
 @app.route('/api/categories/<int:category_id>', methods=['DELETE'])
 @admin_required
 def delete_category(category_id, **kwargs):
+    current_user = kwargs.get('current_user')  # Get current admin user
     category = Category.query.get(category_id)
     if not category:
         logger.warning(f"Attempt to delete non-existent category with ID: {category_id}")
         return jsonify({"message": "Category not found"}), 404
+
+    category_name_for_log = category.name  # Capture name before deletion
+
     try:
         db.session.delete(category)
         db.session.commit()
-        logger.info(f"Category '{category.name}' (ID: {category_id}) deleted successfully.")
+        logger.info(f"Category '{category_name_for_log}' (ID: {category_id}) deleted successfully.")
+        # Log admin action
+        new_log_entry = AdminLogEntry(
+            admin_id=current_user.id,
+            admin_username=current_user.username,
+            action_type='DELETE',
+            resource_type='CATEGORY',
+            resource_id=category_id,
+            details=f"Deleted category: {category_name_for_log}"
+        )
+        db.session.add(new_log_entry)
+        db.session.commit()  # Commit log entry
         return jsonify({"message": "Category deleted successfully!"}), 200
     except Exception as e:
         db.session.rollback()
@@ -608,6 +676,7 @@ def delete_category(category_id, **kwargs):
 @app.route('/api/nominees', methods=['POST'])
 @admin_required
 def create_nominee(**kwargs):
+    current_user = kwargs.get('current_user') # Get current admin user
     if not request.is_json:
         return jsonify({"message": "Request must be JSON"}), 400
 
@@ -617,19 +686,16 @@ def create_nominee(**kwargs):
     description = data.get('description')
     photo_url = data.get('photo_url')
 
-    # Input validation for nominee creation
     if not name or not isinstance(name, str) or not (3 <= len(name) <= 100):
         logger.warning(f"Invalid nominee name during creation: {name}")
         return jsonify({"message": "Nominee name is required and must be 3-100 characters long."}), 400
     if not category_id or not isinstance(category_id, int) or category_id <= 0:
         logger.warning(f"Invalid category_id during nominee creation: {category_id}")
         return jsonify({"message": "Valid category ID is required."}), 400
-    if description is not None and (
-            not isinstance(description, str) or len(description) > 5000):  # Allow longer text for description
+    if description is not None and (not isinstance(description, str) or len(description) > 5000):
         logger.warning(f"Invalid nominee description during creation for name '{name}'.")
         return jsonify({"message": "Nominee description must be a string up to 5000 characters."}), 400
-    if photo_url is not None and (
-            not isinstance(photo_url, str) or not photo_url.startswith('http')):  # Basic URL check
+    if photo_url is not None and (not isinstance(photo_url, str) or not photo_url.startswith('http')):
         logger.warning(f"Invalid nominee photo_url during creation for name '{name}'.")
         return jsonify({"message": "Photo URL must be a valid URL string."}), 400
 
@@ -653,6 +719,17 @@ def create_nominee(**kwargs):
         db.session.add(new_nominee)
         db.session.commit()
         logger.info(f"Nominee '{name}' created successfully in category {category.name}.")
+        # Log admin action
+        new_log_entry = AdminLogEntry(
+            admin_id=current_user.id,
+            admin_username=current_user.username,
+            action_type='CREATE',
+            resource_type='NOMINEE',
+            resource_id=new_nominee.id,
+            details=f"Created nominee: {new_nominee.name} in category {category.name}"
+        )
+        db.session.add(new_log_entry)
+        db.session.commit() # Commit log entry
         return jsonify({
             "message": "Nominee created successfully!",
             "nominee_id": new_nominee.id,
@@ -693,7 +770,6 @@ def get_all_nominees():
     logger.info(f"Retrieved {len(nominees)} nominees (filtered by category_id: {category_id or 'None'}).")
     return jsonify({"nominees": output}), 200
 
-
 @app.route('/api/nominees/<int:nominee_id>', methods=['GET'])
 def get_single_nominee(nominee_id):
     nominee = Nominee.query.get(nominee_id)
@@ -714,6 +790,7 @@ def get_single_nominee(nominee_id):
 @app.route('/api/nominees/<int:nominee_id>', methods=['PUT'])
 @admin_required
 def update_nominee(nominee_id, **kwargs):
+    current_user = kwargs.get('current_user') # Get current admin user
     if not request.is_json:
         return jsonify({"message": "Request must be JSON"}), 400
 
@@ -728,15 +805,18 @@ def update_nominee(nominee_id, **kwargs):
     photo_url = data.get('photo_url')
     new_category_id = data.get('category_id')
 
-    # Input validation for nominee update
+    old_name = nominee.name
+    old_description = nominee.description
+    old_photo_url = nominee.photo_url
+    old_category_id = nominee.category_id
+
     if name:
         if not isinstance(name, str) or not (3 <= len(name) <= 100):
             logger.warning(f"Invalid new nominee name during update for ID {nominee_id}: {name}")
             return jsonify({"message": "Nominee name must be 3-100 characters long."}), 400
         existing_nominee = Nominee.query.filter_by(name=name, category_id=nominee.category_id).first()
         if existing_nominee and existing_nominee.id != nominee_id:
-            logger.info(
-                f"Nominee update failed for ID {nominee_id}: Name '{name}' already exists in category {nominee.category_id}.")
+            logger.info(f"Nominee update failed for ID {nominee_id}: Name '{name}' already exists in category {nominee.category_id}.")
             return jsonify({"message": f"Nominee '{name}' already exists in this category"}), 409
         nominee.name = name
 
@@ -746,8 +826,7 @@ def update_nominee(nominee_id, **kwargs):
             return jsonify({"message": "Valid category ID is required for transfer."}), 400
         new_category = Category.query.get(new_category_id)
         if not new_category:
-            logger.warning(
-                f"Nominee update failed for ID {nominee_id}: New category with ID {new_category_id} not found.")
+            logger.warning(f"Nominee update failed for ID {nominee_id}: New category with ID {new_category_id} not found.")
             return jsonify({"message": "New category not found"}), 404
         nominee.category_id = new_category_id
 
@@ -757,8 +836,7 @@ def update_nominee(nominee_id, **kwargs):
             return jsonify({"message": "Nominee description must be a string up to 5000 characters."}), 400
         nominee.description = description
     if photo_url is not None:
-        if not isinstance(photo_url, str) or (
-                photo_url and not photo_url.startswith('http')):  # Allow empty string to clear URL
+        if not isinstance(photo_url, str) or (photo_url and not photo_url.startswith('http')):
             logger.warning(f"Invalid nominee photo_url during update for ID {nominee_id}.")
             return jsonify({"message": "Photo URL must be a valid URL string or empty."}), 400
         nominee.photo_url = photo_url
@@ -766,6 +844,25 @@ def update_nominee(nominee_id, **kwargs):
     try:
         db.session.commit()
         logger.info(f"Nominee '{nominee.name}' (ID: {nominee_id}) updated successfully.")
+        # Log admin action
+        details = {}
+        if name and name != old_name: details['name_changed_from'] = old_name; details['name_changed_to'] = name
+        if description is not None and description != old_description: details['description_changed_from'] = old_description; details['description_changed_to'] = description
+        if photo_url is not None and photo_url != old_photo_url: details['photo_url_changed_from'] = old_photo_url; details['photo_url_changed_to'] = photo_url
+        if new_category_id and new_category_id != old_category_id: details['category_id_changed_from'] = old_category_id; details['category_id_changed_to'] = new_category_id
+
+        if details:
+            import json # Import json module here for dumping details
+            new_log_entry = AdminLogEntry(
+                admin_id=current_user.id,
+                admin_username=current_user.username,
+                action_type='UPDATE',
+                resource_type='NOMINEE',
+                resource_id=nominee.id,
+                details=json.dumps(details)
+            )
+            db.session.add(new_log_entry)
+            db.session.commit()
         return jsonify({"message": "Nominee updated successfully!", "nominee": {
             'id': nominee.id,
             'name': nominee.name,
@@ -784,14 +881,30 @@ def update_nominee(nominee_id, **kwargs):
 @app.route('/api/nominees/<int:nominee_id>', methods=['DELETE'])
 @admin_required
 def delete_nominee(nominee_id, **kwargs):
+    current_user = kwargs.get('current_user')  # Get current admin user
     nominee = Nominee.query.get(nominee_id)
     if not nominee:
         logger.warning(f"Attempt to delete non-existent nominee with ID: {nominee_id}")
         return jsonify({"message": "Nominee not found"}), 404
+
+    nominee_name_for_log = nominee.name
+    category_name_for_log = nominee.category.name if nominee.category else 'N/A'
+
     try:
         db.session.delete(nominee)
         db.session.commit()
-        logger.info(f"Nominee '{nominee.name}' (ID: {nominee_id}) deleted successfully.")
+        logger.info(f"Nominee '{nominee_name_for_log}' (ID: {nominee_id}) deleted successfully.")
+        # Log admin action
+        new_log_entry = AdminLogEntry(
+            admin_id=current_user.id,
+            admin_username=current_user.username,
+            action_type='DELETE',
+            resource_type='NOMINEE',
+            resource_id=nominee_id,
+            details=f"Deleted nominee: {nominee_name_for_log} from category {category_name_for_log}"
+        )
+        db.session.add(new_log_entry)
+        db.session.commit()  # Commit log entry
         return jsonify({"message": "Nominee deleted successfully!"}), 200
     except Exception as e:
         db.session.rollback()
@@ -1417,6 +1530,7 @@ def get_award_settings(**kwargs):
 @app.route('/api/admin/settings', methods=['PUT'])
 @admin_required
 def update_award_setting(**kwargs):
+    current_user = kwargs.get('current_user')  # Get current admin user
     """
     Updates a specific award show setting by its key. Admin only.
     Expects JSON input with 'key' and 'value'.
@@ -1428,12 +1542,12 @@ def update_award_setting(**kwargs):
     key = data.get('key')
     value = data.get('value')
 
-    # Input validation for settings update
+    old_value = None  # Store old value for log details
+
     if not key or not isinstance(key, str) or not (1 <= len(key) <= 100):
         logger.warning(f"Invalid setting key during update: {key}")
         return jsonify({"message": "Setting key is required and must be 1-100 characters long."}), 400
     if value is None or not isinstance(value, str) or len(value) > 255:
-        # Value can be an empty string, but must be a string and within length
         logger.warning(f"Invalid setting value during update for key '{key}': {value}")
         return jsonify({"message": "Setting value is required and must be a string up to 255 characters."}), 400
 
@@ -1442,11 +1556,24 @@ def update_award_setting(**kwargs):
         logger.warning(f"Attempt to update non-existent setting with key: {key}")
         return jsonify({"message": f"Setting with key '{key}' not found"}), 404
 
-    setting.value = value  # Value is already string validated
+    old_value = setting.value  # Capture old value before update
+    setting.value = value
 
     try:
         db.session.commit()
         logger.info(f"Setting '{key}' updated successfully to '{value}'.")
+        # Log admin action
+        if value != old_value:  # Only log if value actually changed
+            new_log_entry = AdminLogEntry(
+                admin_id=current_user.id,
+                admin_username=current_user.username,
+                action_type='UPDATE',
+                resource_type='SETTING',
+                resource_id=setting.id,
+                details=f"Updated setting '{key}' from '{old_value}' to '{value}'"
+            )
+            db.session.add(new_log_entry)
+            db.session.commit()  # Commit log entry
         return jsonify({
             "message": f"Setting '{key}' updated successfully!",
             "setting": {
@@ -1461,8 +1588,48 @@ def update_award_setting(**kwargs):
         logger.exception(f"Error updating setting with key '{key}'.")
         return jsonify({"message": "Something went wrong updating setting"}), 500
 
+# NEW: Admin Audit Log API Endpoint
+@app.route('/api/admin/audit-log', methods=['GET'])
+@admin_required
+def get_audit_log(**kwargs):
+    """
+    Retrieves the admin audit log. Admin only.
+    Can be filtered by action_type, resource_type, or admin_id.
+    Query parameters: ?action_type=<str>&resource_type=<str>&admin_id=<int>
+    """
+    admin_id_filter = request.args.get('admin_id', type=int)
+    action_type_filter = request.args.get('action_type', type=str)
+    resource_type_filter = request.args.get('resource_type', type=str)
+
+    log_query = AdminLogEntry.query
+
+    if admin_id_filter:
+        log_query = log_query.filter_by(admin_id=admin_id_filter)
+    if action_type_filter:
+        log_query = log_query.filter_by(action_type=action_type_filter.upper())
+    if resource_type_filter:
+        log_query = log_query.filter_by(resource_type=resource_type_filter.upper())
+
+    # Order by timestamp, newest first
+    log_entries = log_query.order_by(AdminLogEntry.timestamp.desc()).all()
+
+    output = []
+    for entry in log_entries:
+        output.append({
+            'log_id': entry.id,
+            'admin_id': entry.admin_id,
+            'admin_username': entry.admin_username,
+            'action_type': entry.action_type,
+            'resource_type': entry.resource_type,
+            'resource_id': entry.resource_id,
+            'details': entry.details, # This will be the JSON string for UPDATEs, or simple string for others
+            'timestamp': entry.timestamp.isoformat()
+        })
+    logger.info(f"Admin '{kwargs.get('current_user').username}' retrieved audit log.")
+    return jsonify({"audit_log": output}), 200
 
 # --- End API Routes ---
+
 
 
 if __name__ == '__main__':
