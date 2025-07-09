@@ -7,12 +7,12 @@ import jwt
 from functools import wraps
 import datetime as dt
 import uuid
-import logging # Import logging module
-from flask_cors import CORS # NEW: Import Flask-CORS
+import logging
+from flask_cors import CORS
 from waitress import serve
-import requests # Import requests for external API calls
-import hashlib # For webhook signature verification (though simplified in this lesson)
-import hmac # For webhook signature verification
+import requests
+import hashlib
+import hmac
 
 # Load environment variables from .env file
 from dotenv import load_dotenv
@@ -21,7 +21,7 @@ load_dotenv()
 # Initialize the Flask application
 app = Flask(__name__)
 
-CORS(app) # Allows CORS for all routes and all origins for development simplicity
+CORS(app)
 
 # Configure secret keys and Paystack API keys
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY')
@@ -29,15 +29,19 @@ if not app.config['SECRET_KEY']:
     raise RuntimeError("SECRET_KEY not set in .env file. Please generate a strong secret key.")
 
 # Paystack configuration
-PAYSTACK_TEST_SECRET_KEY = os.getenv('PAYSTACK_TEST_SECRET_KEY')
-if not PAYSTACK_TEST_SECRET_KEY:
-    raise RuntimeError("PAYSTACK_TEST_SECRET_KEY not set in .env file.")
+app.config['PAYSTACK_SECRET_KEY'] = os.getenv('PAYSTACK_TEST_SECRET_KEY') # This is your actual secret key for API calls
+if not app.config['PAYSTACK_SECRET_KEY']:
+    raise RuntimeError("PAYSTACK_TEST_SECRET_KEY not set in .env file or Cloud Run environment.")
 
-# Paystack API Base URL (test environment)
-app.config['PAYSTACK_SECRET_KEY']     = os.getenv('PAYSTACK_TEST_SECRET_KEY')
-app.config['PAYSTACK_API_BASE_URL']   = os.getenv('PAYSTACK_API_BASE_URL', 'https://api.paystack.co')
-app.config['PAYSTACK_CALLBACK_URL']   = os.getenv('PAYSTACK_CALLBACK_URL')
-app.config['PAYSTACK_WEBHOOK_URL']    = os.getenv('PAYSTACK_WEBHOOK_URL')
+app.config['PAYSTACK_API_BASE_URL'] = os.getenv('PAYSTACK_API_BASE_URL', 'https://api.paystack.co')
+app.config['PAYSTACK_CALLBACK_URL'] = os.getenv('PAYSTACK_CALLBACK_URL', 'http://127.0.0.1:5000/api/payment/paystack-callback') # Default for local
+app.config['PAYSTACK_WEBHOOK_URL'] = os.getenv('PAYSTACK_WEBHOOK_URL', 'http://127.0.0.1:5000/api/payment/paystack-webhook') # Default for local
+# --- END CORRECTED PAYSTACK CONFIGURATION ---
+
+
+# NEW: Bootstrap Admin Key
+app.config['BOOTSTRAP_KEY'] = os.getenv('BOOTSTRAP_KEY')
+# No RuntimeError here, as it might be None if bootstrap is not intended or already done.
 
 
 # Configure the database URI from DATABASE_URL (e.g. on Render) or fall back to SQLite
@@ -53,7 +57,6 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
 # --- Basic Logging Configuration ---
-# Set up a basic logger for the application
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -74,27 +77,16 @@ class User(db.Model):
     role = db.Column(db.String(20), default='user', nullable=False)
     vote_balance = db.Column(db.Integer, default=0, nullable=False)
 
-    # Relationship to Votes. A user can cast many votes.
     votes = db.relationship('Vote', backref='voter', lazy=True)
     transactions = db.relationship('Transaction', backref='buyer', lazy=True)
 
     def __repr__(self):
-        """
-        Provides a string representation of the User object,
-        useful for debugging.
-        """
         return f'<User {self.username}>'
 
     def set_password(self, password):
-        """
-        Hashes the provided plain-text password and stores it in password_hash.
-        """
         self.password_hash = generate_password_hash(password)
 
     def check_password(self, password):
-        """
-        Checks if the provided plain-text password matches the stored hash.
-        """
         return check_password_hash(self.password_hash, password)
 
 
@@ -106,7 +98,6 @@ class Category(db.Model):
     name = db.Column(db.String(100), unique=True, nullable=False)
     description = db.Column(db.String(255), nullable=True)
 
-    # Define a relationship to the Nominee model.
     nominees = db.relationship('Nominee', backref='category', lazy=True, cascade="all, delete-orphan")
 
     def __repr__(self):
@@ -123,11 +114,8 @@ class Nominee(db.Model):
     photo_url = db.Column(db.String(255), nullable=True)
     category_id = db.Column(db.Integer, db.ForeignKey('category.id'), nullable=False)
 
-    # Vote count is kept on the Nominee model for quick aggregation,
-    # but actual votes are stored in the Vote table for detailed history/auditing.
     vote_count = db.Column(db.Integer, default=0, nullable=False)
 
-    # Relationship to Votes. A nominee can receive many votes.
     received_votes = db.relationship('Vote', backref='nominee', lazy=True, cascade="all, delete-orphan")
 
     def __repr__(self):
@@ -1588,7 +1576,7 @@ def update_award_setting(**kwargs):
         logger.exception(f"Error updating setting with key '{key}'.")
         return jsonify({"message": "Something went wrong updating setting"}), 500
 
-# NEW: Admin Audit Log API Endpoint
+# Admin Audit Log API Endpoint
 @app.route('/api/admin/audit-log', methods=['GET'])
 @admin_required
 def get_audit_log(**kwargs):
@@ -1628,8 +1616,114 @@ def get_audit_log(**kwargs):
     logger.info(f"Admin '{kwargs.get('current_user').username}' retrieved audit log.")
     return jsonify({"audit_log": output}), 200
 
-# --- End API Routes ---
+# Admin Audit Log API Endpoint
+@app.route('/api/admin/audit-log', methods=['GET'])
+@admin_required
+def get_audit_log(**kwargs):
+    """
+    Retrieves the admin audit log. Admin only.
+    Can be filtered by action_type, resource_type, or admin_id.
+    Query parameters: ?action_type=<str>&resource_type=<str>&admin_id=<int>
+    """
+    admin_id_filter = request.args.get('admin_id', type=int)
+    action_type_filter = request.args.get('action_type', type=str)
+    resource_type_filter = request.args.get('resource_type', type=str)
 
+    log_query = AdminLogEntry.query
+
+    if admin_id_filter:
+        log_query = log_query.filter_by(admin_id=admin_id_filter)
+    if action_type_filter:
+        log_query = log_query.filter_by(action_type=action_type_filter.upper())
+    if resource_type_filter:
+        log_query = log_query.filter_by(resource_type=resource_type_filter.upper())
+
+    # Order by timestamp, newest first
+    log_entries = log_query.order_by(AdminLogEntry.timestamp.desc()).all()
+
+    output = []
+    for entry in log_entries:
+        output.append({
+            'log_id': entry.id,
+            'admin_id': entry.admin_id,
+            'admin_username': entry.admin_username,
+            'action_type': entry.action_type,
+            'resource_type': entry.resource_type,
+            'resource_id': entry.resource_id,
+            'details': entry.details, # This will be the JSON string for UPDATEs, or simple string for others
+            'timestamp': entry.timestamp.isoformat()
+        })
+    logger.info(f"Admin '{kwargs.get('current_user').username}' retrieved audit log.")
+    return jsonify({"audit_log": output}), 200
+
+
+# Initial Super Admin Bootstrap Endpoint ---
+@app.route('/api/bootstrap-admin', methods=['POST'])
+def bootstrap_admin():
+    # Check for the BOOTSTRAP_KEY from environment variables
+    bootstrap_key = app.config.get('BOOTSTRAP_KEY')
+    if not bootstrap_key:
+        logger.error("BOOTSTRAP_KEY is not set. Bootstrap endpoint is disabled.")
+        return jsonify({"message": "Bootstrap functionality is disabled."}), 403 # Forbidden
+
+    # Verify the provided bootstrap key matches the configured one
+    provided_key = request.headers.get('X-Bootstrap-Key') # Expect key in header
+    if not provided_key or provided_key != bootstrap_key:
+        logger.warning("Unauthorized attempt to access bootstrap-admin endpoint.")
+        return jsonify({"message": "Unauthorized."}), 401
+
+    # Check if an admin user already exists
+    if User.query.filter_by(role='admin').first():
+        logger.warning("Attempt to create admin via bootstrap, but an admin already exists.")
+        return jsonify({"message": "An admin user already exists. Bootstrap is a one-time operation."}), 409
+
+    if not request.is_json:
+        return jsonify({"message": "Request must be JSON"}), 400
+
+    data = request.get_json()
+    username = data.get('username')
+    email = data.get('email')
+    password = data.get('password')
+
+    # Basic validation for the new admin user
+    if not username or not email or not password:
+        return jsonify({"message": "Missing username, email, or password for new admin."}), 400
+    if not isinstance(username, str) or not (3 <= len(username) <= 80):
+        return jsonify({"message": "Username must be 3-80 characters long."}), 400
+    if not isinstance(email, str) or '@' not in email or '.' not in email:
+        return jsonify({"message": "Valid email is required."}), 400
+    if not isinstance(password, str) or not (6 <= len(password) <= 128):
+        return jsonify({"message": "Password must be at least 6 characters long."}), 400
+
+    # Ensure username/email are unique
+    if User.query.filter_by(username=username).first():
+        return jsonify({"message": "Username already exists."}), 409
+    if User.query.filter_by(email=email).first():
+        return jsonify({"message": "Email already exists."}), 409
+
+    # Create the new admin user
+    new_admin_user = User(username=username, email=email, role='admin')
+    new_admin_user.set_password(password)
+
+    try:
+        db.session.add(new_admin_user)
+        db.session.commit()
+        logger.info(f"Initial super admin '{username}' created successfully via bootstrap.")
+
+        # IMPORTANT: After successful bootstrap, you should ideally disable this endpoint
+        # or remove the BOOTSTRAP_KEY from your environment variables in production.
+        # For this lesson, we've designed it to only work once if an admin exists.
+        return jsonify({
+            "message": "Super admin created successfully!",
+            "admin_username": new_admin_user.username,
+            "admin_public_id": new_admin_user.public_id
+        }), 201
+    except Exception as e:
+        db.session.rollback()
+        logger.exception(f"Error creating initial super admin via bootstrap for '{username}'.")
+        return jsonify({"message": "Something went wrong creating the super admin."}), 500
+
+# --- End Initial Super Admin Bootstrap Endpoint ---
 
 
 if __name__ == '__main__':
@@ -1644,5 +1738,3 @@ if __name__ == '__main__':
 
     # If you ever want to run the Flask dev server instead, you could do:
     # app.run(debug=True, port=port)
-
-
