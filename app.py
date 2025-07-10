@@ -29,17 +29,15 @@ if not app.config['SECRET_KEY']:
     raise RuntimeError("SECRET_KEY not set in .env file. Please generate a strong secret key.")
 
 # Paystack configuration
-app.config['PAYSTACK_SECRET_KEY'] = os.getenv('PAYSTACK_TEST_SECRET_KEY') # This is your actual secret key for API calls
+app.config['PAYSTACK_SECRET_KEY'] = os.getenv('PAYSTACK_TEST_SECRET_KEY') # Use TEST key for now
 if not app.config['PAYSTACK_SECRET_KEY']:
-    raise RuntimeError("PAYSTACK_TEST_SECRET_KEY not set in .env file or Cloud Run environment.")
+    raise RuntimeError("PAYSTACK_TEST_SECRET_KEY not set in .env file.")
 
 app.config['PAYSTACK_API_BASE_URL'] = os.getenv('PAYSTACK_API_BASE_URL', 'https://api.paystack.co')
 app.config['PAYSTACK_CALLBACK_URL'] = os.getenv('PAYSTACK_CALLBACK_URL', 'http://127.0.0.1:5000/api/payment/paystack-callback') # Default for local
 app.config['PAYSTACK_WEBHOOK_URL'] = os.getenv('PAYSTACK_WEBHOOK_URL', 'http://127.0.0.1:5000/api/payment/paystack-webhook') # Default for local
-# --- END CORRECTED PAYSTACK CONFIGURATION ---
 
-
-# NEW: Bootstrap Admin Key
+# Bootstrap Admin Key
 app.config['BOOTSTRAP_KEY'] = os.getenv('BOOTSTRAP_KEY')
 # No RuntimeError here, as it might be None if bootstrap is not intended or already done.
 
@@ -374,7 +372,7 @@ def login():
     token_payload = {
         'public_id': user.public_id,
         'role': user.role,
-        'exp': dt.datetime.now() + dt.timedelta(minutes=30)
+        'exp': dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=30)
     }
     token = jwt.encode(token_payload, app.config['SECRET_KEY'], algorithm='HS256')
     logger.info(f"User '{username}' logged in successfully.")
@@ -865,7 +863,6 @@ def update_nominee(nominee_id, **kwargs):
         logger.exception(f"Error updating nominee (ID: {nominee_id}).")
         return jsonify({"message": "Something went wrong updating nominee"}), 500
 
-
 @app.route('/api/nominees/<int:nominee_id>', methods=['DELETE'])
 @admin_required
 def delete_nominee(nominee_id, **kwargs):
@@ -952,7 +949,7 @@ def get_user_vote_info(**kwargs):
         "transaction_history": transaction_history_output
     }), 200
 
-# UPDATED: Endpoint for users to initiate vote purchase with Paystack (in GHS)
+# Endpoint for users to initiate vote purchase with Paystack (in GHS)
 @app.route('/api/buy-votes', methods=['POST'])
 @token_required
 def initiate_vote_purchase(**kwargs):
@@ -1367,7 +1364,7 @@ def cast_vote(**kwargs):
     # 4) Enforce voting window
     start_cfg = AwardSetting.query.filter_by(key='voting_start_time').first()
     end_cfg = AwardSetting.query.filter_by(key='voting_end_time').first()
-    now = dt.datetime.now()
+    now = dt.datetime.now(dt.timezone.utc)
     if start_cfg and end_cfg:
         try:
             start_time = dt.datetime.fromisoformat(start_cfg.value)
@@ -1615,47 +1612,6 @@ def get_audit_log(**kwargs):
         })
     logger.info(f"Admin '{kwargs.get('current_user').username}' retrieved audit log.")
     return jsonify({"audit_log": output}), 200
-
-# Admin Audit Log API Endpoint
-@app.route('/api/admin/audit-log', methods=['GET'])
-@admin_required
-def get_audit_log(**kwargs):
-    """
-    Retrieves the admin audit log. Admin only.
-    Can be filtered by action_type, resource_type, or admin_id.
-    Query parameters: ?action_type=<str>&resource_type=<str>&admin_id=<int>
-    """
-    admin_id_filter = request.args.get('admin_id', type=int)
-    action_type_filter = request.args.get('action_type', type=str)
-    resource_type_filter = request.args.get('resource_type', type=str)
-
-    log_query = AdminLogEntry.query
-
-    if admin_id_filter:
-        log_query = log_query.filter_by(admin_id=admin_id_filter)
-    if action_type_filter:
-        log_query = log_query.filter_by(action_type=action_type_filter.upper())
-    if resource_type_filter:
-        log_query = log_query.filter_by(resource_type=resource_type_filter.upper())
-
-    # Order by timestamp, newest first
-    log_entries = log_query.order_by(AdminLogEntry.timestamp.desc()).all()
-
-    output = []
-    for entry in log_entries:
-        output.append({
-            'log_id': entry.id,
-            'admin_id': entry.admin_id,
-            'admin_username': entry.admin_username,
-            'action_type': entry.action_type,
-            'resource_type': entry.resource_type,
-            'resource_id': entry.resource_id,
-            'details': entry.details, # This will be the JSON string for UPDATEs, or simple string for others
-            'timestamp': entry.timestamp.isoformat()
-        })
-    logger.info(f"Admin '{kwargs.get('current_user').username}' retrieved audit log.")
-    return jsonify({"audit_log": output}), 200
-
 
 # Initial Super Admin Bootstrap Endpoint ---
 @app.route('/api/bootstrap-admin', methods=['POST'])
