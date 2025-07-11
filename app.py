@@ -291,7 +291,7 @@ def internal_server_error(error):
 @app.route('/')
 def home():
     logger.info("Home route accessed.") # Logging
-    return jsonify({"message": "Welcome to the Awards Voting Backend!"})
+    return jsonify({"message": "Welcome to the Awards Voting Backend! (CD Test)"})
 
 @app.route('/api/status')
 def status():
